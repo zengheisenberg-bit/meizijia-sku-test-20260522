@@ -162,6 +162,7 @@
       { id: "settings", label: "设置与数据管理" }
     ];
     const STORAGE_KEY = "dessert_sku_profit_tool_v2";
+    const STATIC_SYNC_API_BASE_URL = String(global.SKU_TOOL_SYNC_API_BASE_URL || "").replace(/\/+$/, "");
     function toNumber(value, fallback = 0) {
       const number = Number(value);
       return Number.isFinite(number) ? number : fallback;
@@ -657,6 +658,7 @@
         schedulerMode: String(source.schedulerMode || "daily_close").trim() || "daily_close",
         operator: String(source.operator || "老板").trim() || "老板",
         credentialStorageMode: String(source.credentialStorageMode || "service_environment").trim() || "service_environment",
+        integrationServiceUrl: String(source.integrationServiceUrl || "").trim().replace(/\/+$/, ""),
         auditLogRetentionDays: Math.max(30, Math.round(clampNonNegative(source.auditLogRetentionDays || 90))),
         retryPolicy: normalizeRetryPolicy(source.retryPolicy)
       };
@@ -1452,6 +1454,89 @@
     function saveState(state) {
       state.lastBackup = new Date().toISOString();
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+    function getSyncApiBaseUrl() {
+      const configuredUrl = appState && appState.productionSync ? appState.productionSync.integrationServiceUrl : "";
+      return String(STATIC_SYNC_API_BASE_URL || configuredUrl || "").trim().replace(/\/+$/, "");
+    }
+    function isFeishuSyncEnabled() {
+      return Boolean(getSyncApiBaseUrl());
+    }
+    async function postJsonToIntegrationService(path, payload) {
+      if (!isFeishuSyncEnabled()) return { status: "disabled", reason: "sync_api_not_configured" };
+      if (typeof fetch !== "function") return { status: "disabled", reason: "fetch_unavailable" };
+      const response = await fetch(`${getSyncApiBaseUrl()}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify(payload)
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(body.error || "integration_service_error");
+        error.response = body;
+        throw error;
+      }
+      return body;
+    }
+    function buildProductFeishuPayload(productItem, stateInput) {
+      const state = normalizeState(stateInput || appState);
+      const safety = getProductCostSafety(productItem, state);
+      return {
+        product: {
+          id: productItem.id,
+          name: productItem.name,
+          price: roundMoney(productItem.price),
+          standardCost: roundMoney(safety.cost.standardCost),
+          safetyBuffer: roundMoney(safety.buffer)
+        }
+      };
+    }
+    async function syncProductToIntegrationService(productItem, stateInput) {
+      return postJsonToIntegrationService("/products/feishu", buildProductFeishuPayload(productItem, stateInput));
+    }
+    function buildDailyRecordFeishuPayload(record) {
+      return {
+        record: {
+          id: record.id,
+          date: record.date,
+          sales: (Array.isArray(record.sales) ? record.sales : []).map((line) => ({
+            productId: line.productId,
+            productName: line.productName,
+            qty: line.qty,
+            netRevenue: roundMoney(line.netRevenue),
+            contributionProfit: roundMoney(line.contributionProfit),
+            targetProfit: roundMoney(line.targetProfit)
+          })),
+          categorySales: (Array.isArray(record.categorySales) ? record.categorySales : []).map((line) => ({
+            categoryId: line.categoryId,
+            category: line.category,
+            sourcePlatform: line.sourcePlatform,
+            netRevenue: roundMoney(line.netRevenue),
+            estimatedCostRate: toNumber(line.estimatedCostRate)
+          })),
+          otherRevenue: roundMoney(record.otherRevenue),
+          transactions: toNumber(record.transactions)
+        }
+      };
+    }
+    async function syncDailyRecordToIntegrationService(record) {
+      return postJsonToIntegrationService("/daily-records/feishu", buildDailyRecordFeishuPayload(record));
+    }
+    function syncProductInBackground(productItem, stateInput) {
+      if (!isFeishuSyncEnabled()) return;
+      syncProductToIntegrationService(productItem, stateInput)
+        .then((result) => {
+          if (result && result.status && result.status !== "disabled") renderToast("SKU 已同步到飞书");
+        })
+        .catch(() => renderToast("本地已保存，飞书同步失败"));
+    }
+    function syncDailyRecordInBackground(record) {
+      if (!isFeishuSyncEnabled()) return;
+      syncDailyRecordToIntegrationService(record)
+        .then((result) => {
+          if (result && result.status && result.status !== "disabled") renderToast("今日经营快照已同步到飞书");
+        })
+        .catch(() => renderToast("本地已保存，飞书同步失败"));
     }
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -2850,6 +2935,10 @@
               <input id="feishuBaseNameInput" name="feishuBaseName" type="text" value="${escapeHtml(feishu.baseName)}" placeholder="经营后台 Base">
             </div>
             <div class="form-field">
+              <label for="integrationServiceUrlInput">集成服务 API 地址</label>
+              <input id="integrationServiceUrlInput" name="integrationServiceUrl" type="url" value="${escapeHtml(state.productionSync.integrationServiceUrl)}" placeholder="https://api.example.com">
+            </div>
+            <div class="form-field">
               <label for="feishuConnectionStatusInput">Base/App Token 状态</label>
               <select id="feishuConnectionStatusInput" name="feishuConnectionStatus">
                 <option value="not_configured" ${feishu.connectionStatus === "not_configured" ? "selected" : ""}>未配置</option>
@@ -3026,6 +3115,7 @@
       productItem.updatedAt = todayISO();
       appState = state;
       saveState(appState);
+      syncProductInBackground(productItem, appState);
       renderToast("售价已更新");
     }
     function handleOptimizeRecipe(productId) {
@@ -3135,6 +3225,7 @@
         });
         appState = state;
         saveState(appState);
+        syncProductInBackground(productItem, appState);
         renderToast("产品配方已更新");
         return true;
       } catch (error) {
@@ -3171,6 +3262,7 @@
       });
       appState = state;
       saveState(appState);
+      syncProductInBackground(state.products.at(-1), appState);
       renderToast("新增产品已创建，请补充售价和 BOM");
     }
     function handleAddRevenueCategory() {
@@ -3333,6 +3425,7 @@
       const dataSourceModeInput = document.getElementById("dataSourceModeInput");
       const feishuAppNameInput = document.getElementById("feishuAppNameInput");
       const feishuBaseNameInput = document.getElementById("feishuBaseNameInput");
+      const integrationServiceUrlInput = document.getElementById("integrationServiceUrlInput");
       const feishuConnectionStatusInput = document.getElementById("feishuConnectionStatusInput");
       const feishuSchemaStatusInput = document.getElementById("feishuSchemaStatusInput");
       const good = clampRate(goodInput && goodInput.value);
@@ -3370,6 +3463,10 @@
           integrationService: state.platformMappings.feishu.integrationServiceStatus === "ready",
           secretsExternalized: true
         }
+      });
+      state.productionSync = normalizeProductionSyncConfig({
+        ...state.productionSync,
+        integrationServiceUrl: String((integrationServiceUrlInput && integrationServiceUrlInput.value) || "").trim()
       });
       appState = state;
       saveState(appState);
@@ -3761,6 +3858,7 @@
       appState = state;
       upsertRecord(appState, record);
       saveState(appState);
+      syncDailyRecordInBackground(record);
       renderToast("今日经营快照已保存");
       setPage("dashboard");
     }
@@ -4228,6 +4326,11 @@
       evaluateProductionReadiness,
       buildSyncIdempotencyKey,
       planNextSyncRetry,
+      postJsonToIntegrationService,
+      buildProductFeishuPayload,
+      syncProductToIntegrationService,
+      buildDailyRecordFeishuPayload,
+      syncDailyRecordToIntegrationService,
       handleImportYouzanFixture,
       handleImportYouzanCsv,
       handleEditIngredient,
